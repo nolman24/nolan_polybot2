@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==21.6
+requests==2.31.0
+python-dotenv==1.0.0
+py-clob-client==0.17.0
