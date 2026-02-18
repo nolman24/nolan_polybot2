@@ -248,8 +248,14 @@ def alchemy_rpc(method: str, params: list):
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     try:
         r = requests.post(ALCHEMY_URL, json=payload, timeout=10)
+        if r.status_code != 200:
+            log.error(f"Alchemy RPC ({method}): {r.status_code} - Response: {r.text[:200]}")
         r.raise_for_status()
-        return r.json().get("result")
+        result = r.json()
+        if "error" in result:
+            log.error(f"Alchemy RPC ({method}) error: {result['error']}")
+            return None
+        return result.get("result")
     except Exception as e:
         log.error(f"Alchemy RPC ({method}): {e}")
         return None
@@ -469,7 +475,7 @@ def get_market_spread(condition_id: str, outcome: str) -> float | None:
         log.error(f"Spread calc error: {e}")
     return None
 
-async def lookup_market_for_tx_async(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
+async def lookup_market_for_tx(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
     """
     Look up market details for a transaction.
     Uses Gamma API with RETRY LOGIC because there's an indexing delay.
@@ -529,12 +535,6 @@ async def lookup_market_for_tx_async(tx_hash: str, token_id: int = 0, amount_raw
         "amount_usdc": 0,
         "source": "failed_lookup"
     }
-
-def lookup_market_for_tx(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
-    """Sync wrapper for backward compatibility."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(lookup_market_for_tx_async(tx_hash, token_id, amount_raw))
 
 def get_market_info(condition_id: str) -> dict:
     try:
@@ -1246,7 +1246,7 @@ async def process_onchain_tx(tx_hash: str, app: Application, token_id: int = 0, 
     if len(state["seen_tx_hashes"]) > 1000:
         state["seen_tx_hashes"] = state["seen_tx_hashes"][-1000:]
 
-    market_info  = lookup_market_for_tx(tx_hash, token_id, amount_raw)
+    market_info = await lookup_market_for_tx(tx_hash, token_id, amount_raw)
     question     = market_info.get("question", "")
     
     # Skip if lookup failed completely
