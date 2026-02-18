@@ -285,23 +285,67 @@ def estimate_confirmation_lag(gas_gwei: float) -> float:
         return random.uniform(5.0, 15.0)   # heavily congested
 
 def get_wallet_transactions(from_block: int, to_block: int) -> list:
+    """
+    Monitor ERC-1155 TransferSingle and TransferBatch events from Polymarket CTF contract.
+    This catches actual prediction market trades, which show as token transfers not transactions.
+    
+    Event signatures:
+    - TransferSingle(operator, from, to, id, value)
+    - TransferBatch(operator, from, to, ids, values)
+    """
     try:
+        # ERC-1155 TransferSingle event topic
+        TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+        # ERC-1155 TransferBatch event topic  
+        TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+        
         params = [{
             "fromBlock": hex(from_block),
             "toBlock": hex(to_block),
-            "fromAddress": TARGET_WALLET,
-            "toAddress": POLYMARKET_CTF_CONTRACT,
-            "category": ["external", "erc20"],
-            "withMetadata": True,
-            "excludeZeroValue": False,
-            "maxCount": "0x64",
+            "address": POLYMARKET_CTF_CONTRACT,
+            "topics": [
+                [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],  # Either event type
+                None,  # operator (any)
+                "0x" + TARGET_WALLET[2:].zfill(64),  # from (our target wallet, padded to 32 bytes)
+            ]
         }]
-        result = alchemy_rpc("alchemy_getAssetTransfers", params)
-        if result and "transfers" in result:
-            return result["transfers"]
-        return []
+        
+        result = alchemy_rpc("eth_getLogs", params)
+        if not result:
+            return []
+        
+        # Parse events into trade objects
+        trades = []
+        for log_entry in result:
+            tx_hash = log_entry.get("transactionHash")
+            block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+            
+            # Extract token ID from event data
+            # For TransferSingle: id is in topics[3]
+            # For TransferBatch: need to parse data field
+            topics = log_entry.get("topics", [])
+            if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
+                token_id = int(topics[3], 16) if len(topics) > 3 else 0
+                trades.append({
+                    "hash": tx_hash,
+                    "blockNumber": block_num,
+                    "token_id": token_id,
+                    "type": "single"
+                })
+            elif topics[0] == TRANSFER_BATCH_TOPIC:
+                # Batch transfer - could be multiple tokens
+                # For now just flag that we saw activity, will look up via tx hash
+                trades.append({
+                    "hash": tx_hash,
+                    "blockNumber": block_num,
+                    "token_id": 0,
+                    "type": "batch"
+                })
+        
+        return trades
+        
     except Exception as e:
-        log.error(f"Transfers error: {e}")
+        log.error(f"Event logs error: {e}")
         return []
 
 # ─── Polymarket Market / Order Book ───────────────────────────────────────────
