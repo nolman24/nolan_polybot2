@@ -577,48 +577,69 @@ def build_token_market_map() -> dict:
     """
     token_map = {}
     try:
-        # Get active markets - try multiple queries to catch all BTC markets
+        # Strategy: Search for "bitcoin" keyword directly
         all_markets = []
         
-        # Query 1: Active crypto markets
-        r1 = requests.get(
-            f"{POLY_GAMMA_BASE}/markets",
-            params={"active": True, "closed": False, "limit": 200},
-            timeout=10
-        )
-        if r1.status_code == 200:
-            all_markets.extend(r1.json())
+        # Try multiple search terms
+        for search_term in ["bitcoin", "btc"]:
+            try:
+                r = requests.get(
+                    f"{POLY_GAMMA_BASE}/markets",
+                    params={"active": True, "limit": 100, "search": search_term},
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    results = r.json()
+                    if isinstance(results, list):
+                        all_markets.extend(results)
+                        log.info(f"Search '{search_term}' returned {len(results)} markets")
+            except Exception as e:
+                log.error(f"Search for '{search_term}' failed: {e}")
         
-        log.info(f"Fetched {len(all_markets)} total active markets")
+        # Deduplicate by condition_id
+        seen_conditions = set()
+        unique_markets = []
+        for m in all_markets:
+            cid = m.get("conditionId")
+            if cid and cid not in seen_conditions:
+                seen_conditions.add(cid)
+                unique_markets.append(m)
         
-        btc_count = 0
-        for market in all_markets:
+        log.info(f"Found {len(unique_markets)} unique Bitcoin markets total")
+        
+        # Debug: log first few markets
+        for i, market in enumerate(unique_markets[:5]):
+            log.info(f"BTC market {i+1}: {market.get('question', '')[:60]}")
+        
+        token_count = 0
+        for market in unique_markets:
             question = market.get("question", "")
-            
-            # Debug: log first few markets to see what we're getting
-            if btc_count < 3:
-                log.info(f"Sample market: {question[:60]}")
-            
-            if not is_btc_market(question):
-                continue
-            
-            btc_count += 1
             condition_id = market.get("conditionId", "")
+            
             if not condition_id:
-                log.warning(f"BTC market missing conditionId: {question[:40]}")
+                log.warning(f"Market missing conditionId: {question[:40]}")
                 continue
             
             # Get token IDs for this market
             tokens = market.get("tokens", [])
             if not tokens:
-                log.warning(f"BTC market has no tokens: {question[:40]}")
+                log.warning(f"Market has no tokens array: {question[:40]}")
+                # Try alternate field names
+                if "clobTokenIds" in market:
+                    log.info(f"Found clobTokenIds instead: {market['clobTokenIds']}")
                 continue
-                
+            
             for idx, token_info in enumerate(tokens):
-                token_id = token_info.get("token_id")
+                # Try multiple field names for token_id
+                token_id = (
+                    token_info.get("token_id") or 
+                    token_info.get("tokenId") or
+                    token_info.get("id") or
+                    token_info.get("clobTokenId")
+                )
+                
                 if token_id:
                     outcome = "YES" if idx == 0 else "NO"
-                    # Also get current price for this outcome
                     outcome_prices = market.get("outcomePrices", [])
                     price = float(outcome_prices[idx]) if len(outcome_prices) > idx else 0.5
                     
@@ -629,17 +650,22 @@ def build_token_market_map() -> dict:
                         "price": price,
                         "token_id": token_id
                     }
+                    token_count += 1
+                else:
+                    log.warning(f"Token {idx} missing ID in market: {question[:40]}, token_info: {token_info}")
         
-        log.info(f"Found {btc_count} BTC markets → {len(token_map)} tokens mapped")
+        log.info(f"Successfully mapped {token_count} tokens from {len(unique_markets)} BTC markets")
         
-        # Debug: log first few token IDs
+        # Debug: log first few token mappings
         for i, (tid, info) in enumerate(list(token_map.items())[:3]):
-            log.info(f"Token {tid[:20]}... → {info['outcome']} on {info['question'][:40]}")
+            log.info(f"Token {tid} → {info['outcome']} on '{info['question'][:50]}'")
         
         return token_map
         
     except Exception as e:
         log.error(f"Error building token map: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return token_map
 
 # Global token map cache (refreshed periodically)
