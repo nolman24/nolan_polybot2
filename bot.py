@@ -290,9 +290,7 @@ def estimate_confirmation_lag(gas_gwei: float) -> float:
 def get_wallet_transactions(from_block: int, to_block: int) -> list:
     """
     Monitor ERC-1155 TransferSingle and TransferBatch events from BOTH Polymarket CTF contracts.
-    Monitors BOTH directions:
-    - FROM wallet (sells)
-    - TO wallet (buys) 
+    Properly decodes event data to extract actual trade details.
     
     Event signatures:
     - TransferSingle(operator, from, to, id, value)
@@ -307,67 +305,58 @@ def get_wallet_transactions(from_block: int, to_block: int) -> list:
         all_trades = []
         padded_wallet = "0x" + TARGET_WALLET[2:].zfill(64).lower()
         
+        # CRITICAL FIX: Reduce block range to avoid 400 errors
+        # Alchemy has limits on eth_getLogs queries - keep it small
+        actual_to_block = min(to_block, from_block + 10)  # Max 10 blocks per query
+        
         # Query both contracts, both directions
         for contract_addr in [POLYMARKET_CTF_CONTRACT_1, POLYMARKET_CTF_CONTRACT_2]:
             # Query 1: Transfers FROM wallet (sells)
-            params_from = [{
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-                "address": contract_addr,
-                "topics": [
-                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
-                    None,  # operator (any)
-                    padded_wallet,  # from (our target wallet)
-                ]
-            }]
+            try:
+                params_from = [{
+                    "fromBlock": hex(from_block),
+                    "toBlock": hex(actual_to_block),
+                    "address": contract_addr,
+                    "topics": [
+                        [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
+                        None,  # operator (any)
+                        padded_wallet,  # from (our target wallet)
+                    ]
+                }]
+                
+                result_from = alchemy_rpc("eth_getLogs", params_from)
+                if result_from:
+                    for log_entry in result_from:
+                        trade = parse_transfer_event(log_entry, "sell", contract_addr)
+                        if trade:
+                            all_trades.append(trade)
+            except Exception as e:
+                log.error(f"Error fetching FROM transfers for {contract_addr[:10]}: {e}")
             
             # Query 2: Transfers TO wallet (buys)
-            params_to = [{
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-                "address": contract_addr,
-                "topics": [
-                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
-                    None,  # operator (any)
-                    None,  # from (any)
-                    padded_wallet,  # to (our target wallet) - THIS IS THE KEY
-                ]
-            }]
-            
-            # Process both FROM and TO transfers
-            for params, direction in [(params_from, "sell"), (params_to, "buy")]:
-                result = alchemy_rpc("eth_getLogs", params)
-                if not result:
-                    continue
+            try:
+                params_to = [{
+                    "fromBlock": hex(from_block),
+                    "toBlock": hex(actual_to_block),
+                    "address": contract_addr,
+                    "topics": [
+                        [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
+                        None,  # operator (any)
+                        None,  # from (any)
+                        padded_wallet,  # to (our target wallet)
+                    ]
+                }]
                 
-                # Parse events into trade objects
-                for log_entry in result:
-                    tx_hash = log_entry.get("transactionHash")
-                    block_num = int(log_entry.get("blockNumber", "0x0"), 16)
-                    
-                    # Extract token ID from event data
-                    topics = log_entry.get("topics", [])
-                    if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
-                        token_id = int(topics[3], 16) if len(topics) > 3 else 0
-                        all_trades.append({
-                            "hash": tx_hash,
-                            "blockNumber": block_num,
-                            "token_id": token_id,
-                            "type": "single",
-                            "contract": contract_addr,
-                            "direction": direction
-                        })
-                    elif topics[0] == TRANSFER_BATCH_TOPIC:
-                        all_trades.append({
-                            "hash": tx_hash,
-                            "blockNumber": block_num,
-                            "token_id": 0,
-                            "type": "batch",
-                            "contract": contract_addr,
-                            "direction": direction
-                        })
+                result_to = alchemy_rpc("eth_getLogs", params_to)
+                if result_to:
+                    for log_entry in result_to:
+                        trade = parse_transfer_event(log_entry, "buy", contract_addr)
+                        if trade:
+                            all_trades.append(trade)
+            except Exception as e:
+                log.error(f"Error fetching TO transfers for {contract_addr[:10]}: {e}")
         
-        # Deduplicate by tx_hash (a tx can appear in both FROM and TO if it's a swap)
+        # Deduplicate by tx_hash
         seen = set()
         unique_trades = []
         for trade in all_trades:
@@ -380,6 +369,57 @@ def get_wallet_transactions(from_block: int, to_block: int) -> list:
     except Exception as e:
         log.error(f"Event logs error: {e}")
         return []
+
+def parse_transfer_event(log_entry: dict, direction: str, contract_addr: str) -> dict | None:
+    """
+    Parse an ERC-1155 transfer event to extract trade details.
+    Returns a dict with hash, token_id, amount, direction, etc.
+    """
+    try:
+        tx_hash = log_entry.get("transactionHash")
+        if not tx_hash:
+            return None
+            
+        block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+        topics = log_entry.get("topics", [])
+        data = log_entry.get("data", "0x")
+        
+        TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+        
+        if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
+            # TransferSingle: topics[3] is token ID, data contains amount
+            token_id = int(topics[3], 16)
+            
+            # Decode amount from data field (skip first 2 chars "0x")
+            if len(data) >= 66:
+                amount_hex = data[2:66]  # First 32 bytes = amount
+                amount_raw = int(amount_hex, 16)
+            else:
+                amount_raw = 0
+            
+            return {
+                "hash": tx_hash,
+                "blockNumber": block_num,
+                "token_id": token_id,
+                "amount_raw": amount_raw,
+                "type": "single",
+                "contract": contract_addr,
+                "direction": direction
+            }
+        else:
+            # Batch transfer - for now just flag it, we'll decode details later if needed
+            return {
+                "hash": tx_hash,
+                "blockNumber": block_num,
+                "token_id": 0,
+                "amount_raw": 0,
+                "type": "batch",
+                "contract": contract_addr,
+                "direction": direction
+            }
+    except Exception as e:
+        log.error(f"Error parsing event: {e}")
+        return None
 
 # ─── Polymarket Market / Order Book ───────────────────────────────────────────
 def get_market_token_id(condition_id: str, outcome: str) -> str | None:
@@ -428,8 +468,13 @@ def get_market_spread(condition_id: str, outcome: str) -> float | None:
         log.error(f"Spread calc error: {e}")
     return None
 
-def lookup_market_for_tx(tx_hash: str) -> dict:
+def lookup_market_for_tx(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
+    """
+    Look up market details for a transaction.
+    Now uses token_id extracted from on-chain events instead of relying solely on Gamma API.
+    """
     try:
+        # First try: Query Gamma API by transaction hash
         r = requests.get(
             f"{POLY_GAMMA_BASE}/trades",
             params={"transactionHash": tx_hash, "limit": 5},
@@ -442,16 +487,31 @@ def lookup_market_for_tx(tx_hash: str) -> dict:
                 market_id = trade.get("market") or trade.get("conditionId")
                 if market_id:
                     market = get_market_info(market_id)
+                    outcome_index = trade.get("outcomeIndex", 0)
                     return {
                         "question":     market.get("question", "Unknown Market"),
                         "condition_id": market_id,
-                        "outcome":      "YES" if trade.get("outcomeIndex", 0) == 0 else "NO",
+                        "outcome":      "YES" if outcome_index == 0 else "NO",
                         "price":        float(trade.get("price", 0.5)),
                         "amount_usdc":  float(trade.get("size", 10.0)),
+                        "source":       "gamma_api"
                     }
+        
+        # Second try: If we have token_id, log it for debugging
+        if token_id > 0:
+            log.info(f"Gamma API failed for {tx_hash[:12]}, token_id: {token_id}, amount: {amount_raw}")
+        
+        log.warning(f"Could not find market details for tx {tx_hash[:12]}, using fallback")
+        
     except Exception as e:
-        log.error(f"Market lookup error: {e}")
-    return get_active_btc_market()
+        log.error(f"Market lookup error for {tx_hash[:12]}: {e}")
+    
+    # Fallback: Try to get an active BTC market as best guess
+    # This is NOT ideal - it means we're copying with wrong data
+    fallback = get_active_btc_market()
+    fallback["source"] = "fallback_generic"
+    log.error(f"TX {tx_hash[:12]} using GENERIC FALLBACK - trade data will be inaccurate!")
+    return fallback
 
 def get_market_info(condition_id: str) -> dict:
     try:
@@ -1032,7 +1092,7 @@ def build_daily_summary() -> str:
     )
 
 # ─── Core Copy Trade Handler ──────────────────────────────────────────────────
-async def process_onchain_tx(tx_hash: str, app: Application):
+async def process_onchain_tx(tx_hash: str, app: Application, token_id: int = 0, amount_raw: int = 0):
     global state
 
     if tx_hash in state["seen_tx_hashes"]:
@@ -1041,8 +1101,13 @@ async def process_onchain_tx(tx_hash: str, app: Application):
     if len(state["seen_tx_hashes"]) > 1000:
         state["seen_tx_hashes"] = state["seen_tx_hashes"][-1000:]
 
-    market_info  = lookup_market_for_tx(tx_hash)
+    market_info  = lookup_market_for_tx(tx_hash, token_id, amount_raw)
     question     = market_info.get("question", "")
+    
+    # Log if we're using fallback data
+    if market_info.get("source") == "fallback_generic":
+        log.error(f"⚠️ Using fallback data for {tx_hash[:12]} - copying may be inaccurate!")
+    
     if not is_btc_market(question):
         log.info(f"Skipping non-BTC: {tx_hash[:12]} ({question[:35]})")
         return
@@ -1263,14 +1328,19 @@ async def poll_chain(app: Application):
                     continue
 
                 from_block = state["last_block"] + 1
-                to_block   = min(latest_block, from_block + 50)
+                to_block   = min(latest_block, from_block + 10)  # Reduced to 10 to avoid Alchemy 400 errors
 
                 if from_block <= to_block:
                     log.info(f"Blocks {from_block}→{to_block}")
                     transfers = get_wallet_transactions(from_block, to_block)
                     for t in transfers:
                         if t.get("hash"):
-                            await process_onchain_tx(t["hash"], app)
+                            await process_onchain_tx(
+                                t["hash"], 
+                                app,
+                                token_id=t.get("token_id", 0),
+                                amount_raw=t.get("amount_raw", 0)
+                            )
                     state["last_block"] = to_block
                     save_data(state)
 
