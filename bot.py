@@ -290,7 +290,9 @@ def estimate_confirmation_lag(gas_gwei: float) -> float:
 def get_wallet_transactions(from_block: int, to_block: int) -> list:
     """
     Monitor ERC-1155 TransferSingle and TransferBatch events from BOTH Polymarket CTF contracts.
-    This catches actual prediction market trades, which show as token transfers not transactions.
+    Monitors BOTH directions:
+    - FROM wallet (sells)
+    - TO wallet (buys) 
     
     Event signatures:
     - TransferSingle(operator, from, to, id, value)
@@ -303,50 +305,77 @@ def get_wallet_transactions(from_block: int, to_block: int) -> list:
         TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
         
         all_trades = []
+        padded_wallet = "0x" + TARGET_WALLET[2:].zfill(64).lower()
         
-        # Query both contracts
+        # Query both contracts, both directions
         for contract_addr in [POLYMARKET_CTF_CONTRACT_1, POLYMARKET_CTF_CONTRACT_2]:
-            params = [{
+            # Query 1: Transfers FROM wallet (sells)
+            params_from = [{
                 "fromBlock": hex(from_block),
                 "toBlock": hex(to_block),
                 "address": contract_addr,
                 "topics": [
-                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],  # Either event type
+                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
                     None,  # operator (any)
-                    "0x" + TARGET_WALLET[2:].zfill(64).lower(),  # from (our target wallet, padded to 32 bytes)
+                    padded_wallet,  # from (our target wallet)
                 ]
             }]
             
-            result = alchemy_rpc("eth_getLogs", params)
-            if not result:
-                continue
+            # Query 2: Transfers TO wallet (buys)
+            params_to = [{
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": contract_addr,
+                "topics": [
+                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],
+                    None,  # operator (any)
+                    None,  # from (any)
+                    padded_wallet,  # to (our target wallet) - THIS IS THE KEY
+                ]
+            }]
             
-            # Parse events into trade objects
-            for log_entry in result:
-                tx_hash = log_entry.get("transactionHash")
-                block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+            # Process both FROM and TO transfers
+            for params, direction in [(params_from, "sell"), (params_to, "buy")]:
+                result = alchemy_rpc("eth_getLogs", params)
+                if not result:
+                    continue
                 
-                # Extract token ID from event data
-                topics = log_entry.get("topics", [])
-                if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
-                    token_id = int(topics[3], 16) if len(topics) > 3 else 0
-                    all_trades.append({
-                        "hash": tx_hash,
-                        "blockNumber": block_num,
-                        "token_id": token_id,
-                        "type": "single",
-                        "contract": contract_addr
-                    })
-                elif topics[0] == TRANSFER_BATCH_TOPIC:
-                    all_trades.append({
-                        "hash": tx_hash,
-                        "blockNumber": block_num,
-                        "token_id": 0,
-                        "type": "batch",
-                        "contract": contract_addr
-                    })
+                # Parse events into trade objects
+                for log_entry in result:
+                    tx_hash = log_entry.get("transactionHash")
+                    block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+                    
+                    # Extract token ID from event data
+                    topics = log_entry.get("topics", [])
+                    if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
+                        token_id = int(topics[3], 16) if len(topics) > 3 else 0
+                        all_trades.append({
+                            "hash": tx_hash,
+                            "blockNumber": block_num,
+                            "token_id": token_id,
+                            "type": "single",
+                            "contract": contract_addr,
+                            "direction": direction
+                        })
+                    elif topics[0] == TRANSFER_BATCH_TOPIC:
+                        all_trades.append({
+                            "hash": tx_hash,
+                            "blockNumber": block_num,
+                            "token_id": 0,
+                            "type": "batch",
+                            "contract": contract_addr,
+                            "direction": direction
+                        })
         
-        return all_trades
+        # Deduplicate by tx_hash (a tx can appear in both FROM and TO if it's a swap)
+        seen = set()
+        unique_trades = []
+        for trade in all_trades:
+            if trade["hash"] not in seen:
+                seen.add(trade["hash"])
+                unique_trades.append(trade)
+        
+        return unique_trades
         
     except Exception as e:
         log.error(f"Event logs error: {e}")
@@ -999,7 +1028,7 @@ async def process_onchain_tx(tx_hash: str, app: Application):
 # ─── Background Polling ───────────────────────────────────────────────────────
 async def poll_chain(app: Application):
     log.info(f"On-chain poll started | wallet: {TARGET_WALLET} | interval: {POLL_INTERVAL}s")
-    log.info(f"Monitoring 2 Polymarket contracts: {POLYMARKET_CTF_CONTRACT_1[:10]}... & {POLYMARKET_CTF_CONTRACT_2[:10]}...")
+    log.info(f"Monitoring 2 Polymarket contracts (buys & sells): {POLYMARKET_CTF_CONTRACT_1[:10]}... & {POLYMARKET_CTF_CONTRACT_2[:10]}...")
     while True:
         if state.get("running") and TARGET_WALLET and ALCHEMY_URL:
             try:
