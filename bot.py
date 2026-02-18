@@ -485,6 +485,207 @@ def get_active_btc_market() -> dict:
 def is_btc_market(question: str) -> bool:
     return any(kw in question.lower() for kw in BTC_KEYWORDS)
 
+# ─── Market Resolution Checker ────────────────────────────────────────────────
+async def check_trade_resolutions(app: Application):
+    """
+    Check if any open trades have resolved and update their status.
+    Runs every 5 minutes as a background task.
+    """
+    global state
+    
+    # Check paper trades
+    for trade in state.get("paper_trades", []):
+        if trade.get("status") != "open":
+            continue
+        
+        # Try to get market resolution from Polymarket
+        condition_id = None
+        # We need to look up the market from the trade details
+        # The tx_hash can help us find it via Gamma API
+        tx_hash = trade.get("tx_hash")
+        if not tx_hash:
+            continue
+            
+        try:
+            # Lookup the trade to get condition_id
+            r = requests.get(
+                f"{POLY_GAMMA_BASE}/trades",
+                params={"transactionHash": tx_hash, "limit": 1},
+                timeout=8
+            )
+            if r.status_code == 200:
+                trades_data = r.json()
+                if isinstance(trades_data, list) and trades_data:
+                    condition_id = trades_data[0].get("market") or trades_data[0].get("conditionId")
+            
+            if not condition_id:
+                continue
+                
+            # Get market info to check if resolved
+            market = get_market_info(condition_id)
+            if not market:
+                continue
+                
+            # Check if market is closed and has outcome
+            closed = market.get("closed", False)
+            resolved = market.get("resolved", False)
+            
+            if not (closed or resolved):
+                continue
+                
+            # Get the winning outcome
+            outcome_prices = market.get("outcomePrices", [])
+            if not outcome_prices or len(outcome_prices) < 2:
+                continue
+            
+            # In a binary market, winning side should be at or near 1.0
+            yes_price = float(outcome_prices[0]) if len(outcome_prices) > 0 else 0
+            no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0
+            
+            # Determine winner (whichever is closer to 1.0)
+            winning_outcome = "YES" if yes_price > no_price else "NO"
+            
+            # Check if our trade won
+            our_outcome = trade.get("outcome", "YES")
+            if our_outcome == winning_outcome:
+                # We won - calculate payout
+                # Payout = (amount / entry_price) * 1.0 (winning tokens pay $1 each)
+                entry_price = trade.get("price") or trade.get("total_cost_basis", 0.5)
+                amount = trade.get("amount_usdc", 0)
+                shares = amount / entry_price if entry_price > 0 else 0
+                payout = shares * 1.0  # Each winning share pays $1
+                
+                trade["status"] = "won"
+                trade["payout"] = round(payout, 2)
+                
+                # Update paper balance
+                if trade.get("mode") == "paper":
+                    state["paper_balance"] += payout
+                
+                # Notify user
+                chat_id = state.get("notifications_chat_id")
+                profit = payout - amount
+                if chat_id:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"✅ *Trade Won!*\n"
+                        f"`{trade['market'][:50]}`\n"
+                        f"💰 Profit: `+${profit:.2f}` (payout: ${payout:.2f})\n"
+                        f"{'💼 Paper balance: $' + str(round(state['paper_balance'], 2)) if trade.get('mode')=='paper' else ''}",
+                        parse_mode="Markdown"
+                    )
+                
+                log.info(f"Trade resolved WIN: {trade['market'][:40]} | +${payout:.2f}")
+            else:
+                # We lost
+                trade["status"] = "lost"
+                trade["payout"] = 0.0
+                
+                # Notify user
+                chat_id = state.get("notifications_chat_id")
+                if chat_id:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"❌ *Trade Lost*\n"
+                        f"`{trade['market'][:50]}`\n"
+                        f"💸 Loss: `-${amount:.2f}`\n"
+                        f"{'💼 Paper balance: $' + str(round(state['paper_balance'], 2)) if trade.get('mode')=='paper' else ''}",
+                        parse_mode="Markdown"
+                    )
+                
+                log.info(f"Trade resolved LOSS: {trade['market'][:40]} | -${trade.get('amount_usdc', 0):.2f}")
+                
+        except Exception as e:
+            log.error(f"Resolution check error for {tx_hash[:12]}: {e}")
+            continue
+    
+    # Check live trades (same logic)
+    for trade in state.get("live_trades", []):
+        if trade.get("status") != "open":
+            continue
+        
+        tx_hash = trade.get("tx_hash")
+        if not tx_hash:
+            continue
+            
+        try:
+            r = requests.get(
+                f"{POLY_GAMMA_BASE}/trades",
+                params={"transactionHash": tx_hash, "limit": 1},
+                timeout=8
+            )
+            if r.status_code == 200:
+                trades_data = r.json()
+                if isinstance(trades_data, list) and trades_data:
+                    condition_id = trades_data[0].get("market") or trades_data[0].get("conditionId")
+            
+            if not condition_id:
+                continue
+                
+            market = get_market_info(condition_id)
+            if not market:
+                continue
+                
+            closed = market.get("closed", False)
+            resolved = market.get("resolved", False)
+            
+            if not (closed or resolved):
+                continue
+                
+            outcome_prices = market.get("outcomePrices", [])
+            if not outcome_prices or len(outcome_prices) < 2:
+                continue
+            
+            yes_price = float(outcome_prices[0]) if len(outcome_prices) > 0 else 0
+            no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0
+            winning_outcome = "YES" if yes_price > no_price else "NO"
+            
+            our_outcome = trade.get("outcome", "YES")
+            if our_outcome == winning_outcome:
+                entry_price = trade.get("price", 0.5)
+                amount = trade.get("amount_usdc", 0)
+                shares = amount / entry_price if entry_price > 0 else 0
+                payout = shares * 1.0
+                
+                trade["status"] = "won"
+                trade["payout"] = round(payout, 2)
+                
+                # Notify user
+                chat_id = state.get("notifications_chat_id")
+                profit = payout - amount
+                if chat_id:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"✅ *LIVE Trade Won!*\n"
+                        f"`{trade['market'][:50]}`\n"
+                        f"💰 Profit: `+${profit:.2f}` (payout: ${payout:.2f})",
+                        parse_mode="Markdown"
+                    )
+                
+                log.info(f"LIVE trade resolved WIN: {trade['market'][:40]} | +${payout:.2f}")
+            else:
+                trade["status"] = "lost"
+                trade["payout"] = 0.0
+                
+                # Notify user
+                chat_id = state.get("notifications_chat_id")
+                if chat_id:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"❌ *LIVE Trade Lost*\n"
+                        f"`{trade['market'][:50]}`\n"
+                        f"💸 Loss: `-${amount:.2f}`",
+                        parse_mode="Markdown"
+                    )
+                
+                log.info(f"LIVE trade resolved LOSS: {trade['market'][:40]} | -${trade.get('amount_usdc', 0):.2f}")
+                
+        except Exception as e:
+            log.error(f"Resolution check error for {tx_hash[:12]}: {e}")
+            continue
+    
+    save_data(state)
+
 # ─── Full Realistic Simulation Engine ─────────────────────────────────────────
 def simulate_realistic_fill(
     intended_price: float,
@@ -1029,11 +1230,24 @@ async def process_onchain_tx(tx_hash: str, app: Application):
 async def poll_chain(app: Application):
     log.info(f"On-chain poll started | wallet: {TARGET_WALLET} | interval: {POLL_INTERVAL}s")
     log.info(f"Monitoring 2 Polymarket contracts (buys & sells): {POLYMARKET_CTF_CONTRACT_1[:10]}... & {POLYMARKET_CTF_CONTRACT_2[:10]}...")
+    log.info(f"Resolution checking: every 5 minutes")
+    
+    resolution_check_counter = 0
+    RESOLUTION_CHECK_INTERVAL = 300  # 5 minutes in seconds
+    checks_per_resolution = RESOLUTION_CHECK_INTERVAL // POLL_INTERVAL
+    
     while True:
         if state.get("running") and TARGET_WALLET and ALCHEMY_URL:
             try:
                 reset_day_if_needed()
                 await check_and_send_daily_summary(app)
+                
+                # Check for market resolutions every 5 minutes
+                resolution_check_counter += 1
+                if resolution_check_counter >= checks_per_resolution:
+                    log.info("Checking for market resolutions...")
+                    await check_trade_resolutions(app)
+                    resolution_check_counter = 0
 
                 latest_block = get_latest_block()
                 if latest_block is None:
@@ -1105,7 +1319,7 @@ def main_menu_keyboard():
 def settings_keyboard():
     loss     = state.get("daily_loss_limit", 200.0)
     cap      = state.get("max_trade_size", 100.0)
-    copy_pct = int(state.get("copy_fraction", 1.0) * 100)
+    copy_pct = state.get("copy_fraction", 1.0) * 100
     summary_h = state.get("daily_summary_hour", 20)
     sim_all  = all([state.get("sim_slippage"), state.get("sim_liquidity"),
                     state.get("sim_fees"), state.get("sim_detection_lag"),
@@ -1114,10 +1328,23 @@ def settings_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("── Copy Size ───────────────", callback_data="noop")],
         [
+            InlineKeyboardButton(f"{'✓ ' if copy_pct==0.1 else ''}0.1%", callback_data="size_0.001"),
+            InlineKeyboardButton(f"{'✓ ' if copy_pct==1 else ''}1%",     callback_data="size_0.01"),
+            InlineKeyboardButton(f"{'✓ ' if copy_pct==5 else ''}5%",     callback_data="size_0.05"),
+            InlineKeyboardButton(f"{'✓ ' if copy_pct==10 else ''}10%",   callback_data="size_0.10"),
+        ],
+        [
             InlineKeyboardButton(f"{'✓ ' if copy_pct==25 else ''}25%",   callback_data="size_0.25"),
             InlineKeyboardButton(f"{'✓ ' if copy_pct==50 else ''}50%",   callback_data="size_0.50"),
             InlineKeyboardButton(f"{'✓ ' if copy_pct==75 else ''}75%",   callback_data="size_0.75"),
             InlineKeyboardButton(f"{'✓ ' if copy_pct==100 else ''}100%", callback_data="size_1.0"),
+        ],
+        [InlineKeyboardButton("── Paper Starting Balance ──", callback_data="noop")],
+        [
+            InlineKeyboardButton(f"{'✓ ' if state['paper_balance']==1000 else ''}$1K",    callback_data="balance_1000"),
+            InlineKeyboardButton(f"{'✓ ' if state['paper_balance']==10000 else ''}$10K",   callback_data="balance_10000"),
+            InlineKeyboardButton(f"{'✓ ' if state['paper_balance']==100000 else ''}$100K",  callback_data="balance_100000"),
+            InlineKeyboardButton(f"{'✓ ' if state['paper_balance']==1000000 else ''}$1M",   callback_data="balance_1000000"),
         ],
         [InlineKeyboardButton("── Daily Loss Limit ─────────", callback_data="noop")],
         [
@@ -1145,7 +1372,7 @@ def settings_keyboard():
             f"{'✅ Realistic Sim: ALL ON' if sim_all else '⬜ Realistic Sim: PARTIAL/OFF'}",
             callback_data="toggle_sim"
         )],
-        [InlineKeyboardButton("🔄 Reset Paper Balance ($1000)", callback_data="reset_paper")],
+        [InlineKeyboardButton("🔄 Clear All Paper Trades", callback_data="reset_paper")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back")],
     ])
 
@@ -1166,6 +1393,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target  = TARGET_WALLET or "⚠️ Not set"
     paused  = " ⚠️ Loss limit hit" if state.get("daily_loss_paused") else ""
     cal_str = f"\n🔬 Cal Samples: `{cal['n_samples']}` | Bias: `{cal['price_bias']*100:+.2f}¢`" if cal["n_samples"] >= 3 else "\n🔬 Calibration: `Not enough data yet`"
+    copy_pct = state.get("copy_fraction", 1.0) * 100
+    copy_str = f"{copy_pct:.1f}%" if copy_pct < 1 else f"{int(copy_pct)}%"
 
     msg = (
         f"🤖 *PolyBot — On-Chain BTC Copy Trader*\n"
@@ -1174,7 +1403,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⛓ Alchemy: `{'✅' if ALCHEMY_URL else '❌'}`\n"
         f"🔵 Mode: `{'📄 Paper' if mode=='paper' else '💰 Live'}`\n"
         f"⚡ Status: `{'Running ✅' if running else 'Stopped ⏸'}`{paused}\n"
-        f"🔁 Copy Size: `{int(state['copy_fraction']*100)}%`\n"
+        f"🔁 Copy Size: `{copy_str}`\n"
         f"🛡 Loss Limit: `{'$'+str(int(state['daily_loss_limit']))+'/day' if state['daily_loss_limit']>0 else 'Off'}`\n"
         f"📏 Size Cap: `{'$'+str(int(state['max_trade_size']))+'/trade' if state['max_trade_size']>0 else 'Off'}`"
         f"{cal_str}"
@@ -1356,13 +1585,18 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cap      = state.get("max_trade_size", 100)
         hour     = state.get("daily_summary_hour", 20)
         hour_str = f"{hour}:00 UTC" if hour != -1 else "Off"
+        copy_pct = state.get("copy_fraction", 1.0) * 100
+        copy_str = f"{copy_pct:.1f}%" if copy_pct < 1 else f"{int(copy_pct)}%"
+        bal      = state.get("paper_balance", 1000)
+        bal_str  = f"${int(bal):,}"
         sim_all  = all([state.get("sim_slippage"), state.get("sim_liquidity"),
                         state.get("sim_fees"), state.get("sim_detection_lag"),
                         state.get("sim_gas_lag"), state.get("sim_queue_competition"),
                         state.get("sim_historical_spreads")])
         msg = (
             f"⚙️ *Settings*\n━━━━━━━━━━━━━━━━\n"
-            f"🔁 Copy Size: `{int(state['copy_fraction']*100)}%`\n"
+            f"🔁 Copy Size: `{copy_str}`\n"
+            f"💼 Paper Balance: `{bal_str}`\n"
             f"🛡 Daily Loss Limit: `{'$'+str(int(loss)) if loss>0 else 'Off'}`\n"
             f"📏 Per-Trade Cap: `{'$'+str(int(cap)) if cap>0 else 'Off'}`\n"
             f"📅 Daily Summary: `{hour_str}`\n"
@@ -1373,7 +1607,17 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("size_"):
         state["copy_fraction"] = float(data.split("_")[1])
         save_data(state)
-        await query.edit_message_text(f"✅ Copy size: `{int(state['copy_fraction']*100)}%`", parse_mode="Markdown", reply_markup=settings_keyboard())
+        pct = state['copy_fraction'] * 100
+        pct_str = f"{pct:.1f}%" if pct < 1 else f"{int(pct)}%"
+        await query.edit_message_text(f"✅ Copy size: `{pct_str}`", parse_mode="Markdown", reply_markup=settings_keyboard())
+
+    elif data.startswith("balance_"):
+        new_balance = float(data.split("_")[1])
+        state["paper_balance"] = new_balance
+        state["day_start_balance"] = new_balance
+        save_data(state)
+        bal_str = f"${int(new_balance):,}" if new_balance >= 1000 else f"${new_balance:.0f}"
+        await query.edit_message_text(f"✅ Paper balance set to `{bal_str}`", parse_mode="Markdown", reply_markup=settings_keyboard())
 
     elif data.startswith("loss_"):
         state["daily_loss_limit"] = float(data.split("_")[1])
@@ -1408,24 +1652,28 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"Realistic simulation: {label}", reply_markup=settings_keyboard())
 
     elif data == "reset_paper":
-        state["paper_balance"]     = 1000.0
         state["paper_trades"]      = []
         state["last_block"]        = None
         state["daily_loss_paused"] = False
-        state["day_start_balance"] = 1000.0
         save_data(state)
-        await query.edit_message_text("✅ Paper balance reset to *$1,000*, trades cleared.", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(
+            f"✅ Paper trades cleared. Balance remains at `${state['paper_balance']:,.0f}`\n"
+            f"_Use 'Paper Starting Balance' buttons above to change balance_",
+            parse_mode="Markdown", reply_markup=settings_keyboard()
+        )
 
     elif data == "back":
-        mode    = state["mode"]
-        running = state.get("running", False)
-        paused  = " ⚠️ Loss limit hit" if state.get("daily_loss_paused") else ""
+        mode     = state["mode"]
+        running  = state.get("running", False)
+        paused   = " ⚠️ Loss limit hit" if state.get("daily_loss_paused") else ""
+        copy_pct = state.get("copy_fraction", 1.0) * 100
+        copy_str = f"{copy_pct:.1f}%" if copy_pct < 1 else f"{int(copy_pct)}%"
         msg = (
             f"🤖 *PolyBot — On-Chain BTC Copy Trader*\n━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👛 `{TARGET_WALLET[:24] if TARGET_WALLET else 'Not set'}...`\n"
             f"🔵 Mode: `{'📄 Paper' if mode=='paper' else '💰 Live'}`\n"
             f"⚡ Status: `{'Running ✅' if running else 'Stopped ⏸'}`{paused}\n"
-            f"🔁 Copy: `{int(state['copy_fraction']*100)}%` | "
+            f"🔁 Copy: `{copy_str}` | "
             f"🛡 `{'$'+str(int(state['daily_loss_limit']))+'/day' if state['daily_loss_limit']>0 else 'No limit'}` | "
             f"📏 `{'$'+str(int(state['max_trade_size']))+'/trade' if state['max_trade_size']>0 else 'No cap'}`"
         )
