@@ -48,8 +48,11 @@ DATA_FILE               = "polybot_data.json"
 SPREAD_HISTORY_FILE     = "spread_history.json"
 CALIBRATION_FILE        = "calibration.json"
 BTC_KEYWORDS            = ["btc", "bitcoin", "btc price", "bitcoin price"]
-POLYMARKET_CTF_CONTRACT = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-POLYMARKET_TAKER_FEE    = 0.02    # 2% taker fee
+# Polymarket has multiple CTF Exchange contracts - monitor both
+POLYMARKET_CTF_CONTRACT_1 = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"  # Original
+POLYMARKET_CTF_CONTRACT_2 = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Newer version
+POLYMARKET_CTF_CONTRACT   = POLYMARKET_CTF_CONTRACT_1  # Keep for backwards compat
+POLYMARKET_TAKER_FEE      = 0.02    # 2% taker fee
 POLYGON_BLOCK_TIME      = 2.0     # seconds per block
 CALIBRATION_TRADE_SIZE  = 5.0     # USDC per calibration trade (tiny, just for measuring)
 MAX_COMPETITOR_WALLETS  = 50      # estimated copy traders watching same wallet
@@ -286,7 +289,7 @@ def estimate_confirmation_lag(gas_gwei: float) -> float:
 
 def get_wallet_transactions(from_block: int, to_block: int) -> list:
     """
-    Monitor ERC-1155 TransferSingle and TransferBatch events from Polymarket CTF contract.
+    Monitor ERC-1155 TransferSingle and TransferBatch events from BOTH Polymarket CTF contracts.
     This catches actual prediction market trades, which show as token transfers not transactions.
     
     Event signatures:
@@ -299,50 +302,51 @@ def get_wallet_transactions(from_block: int, to_block: int) -> list:
         # ERC-1155 TransferBatch event topic  
         TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
         
-        params = [{
-            "fromBlock": hex(from_block),
-            "toBlock": hex(to_block),
-            "address": POLYMARKET_CTF_CONTRACT,
-            "topics": [
-                [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],  # Either event type
-                None,  # operator (any)
-                "0x" + TARGET_WALLET[2:].zfill(64),  # from (our target wallet, padded to 32 bytes)
-            ]
-        }]
+        all_trades = []
         
-        result = alchemy_rpc("eth_getLogs", params)
-        if not result:
-            return []
-        
-        # Parse events into trade objects
-        trades = []
-        for log_entry in result:
-            tx_hash = log_entry.get("transactionHash")
-            block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+        # Query both contracts
+        for contract_addr in [POLYMARKET_CTF_CONTRACT_1, POLYMARKET_CTF_CONTRACT_2]:
+            params = [{
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": contract_addr,
+                "topics": [
+                    [TRANSFER_SINGLE_TOPIC, TRANSFER_BATCH_TOPIC],  # Either event type
+                    None,  # operator (any)
+                    "0x" + TARGET_WALLET[2:].zfill(64).lower(),  # from (our target wallet, padded to 32 bytes)
+                ]
+            }]
             
-            # Extract token ID from event data
-            # For TransferSingle: id is in topics[3]
-            # For TransferBatch: need to parse data field
-            topics = log_entry.get("topics", [])
-            if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
-                token_id = int(topics[3], 16) if len(topics) > 3 else 0
-                trades.append({
-                    "hash": tx_hash,
-                    "blockNumber": block_num,
-                    "token_id": token_id,
-                    "type": "single"
-                })
-            elif topics[0] == TRANSFER_BATCH_TOPIC:
-                # Batch transfer - could be multiple tokens
-                # For now just flag that we saw activity, will look up via tx hash
-                trades.append({
-                    "hash": tx_hash,
-                    "blockNumber": block_num,
-                    "token_id": 0,
-                    "type": "batch"
-                })
+            result = alchemy_rpc("eth_getLogs", params)
+            if not result:
+                continue
+            
+            # Parse events into trade objects
+            for log_entry in result:
+                tx_hash = log_entry.get("transactionHash")
+                block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+                
+                # Extract token ID from event data
+                topics = log_entry.get("topics", [])
+                if len(topics) >= 4 and topics[0] == TRANSFER_SINGLE_TOPIC:
+                    token_id = int(topics[3], 16) if len(topics) > 3 else 0
+                    all_trades.append({
+                        "hash": tx_hash,
+                        "blockNumber": block_num,
+                        "token_id": token_id,
+                        "type": "single",
+                        "contract": contract_addr
+                    })
+                elif topics[0] == TRANSFER_BATCH_TOPIC:
+                    all_trades.append({
+                        "hash": tx_hash,
+                        "blockNumber": block_num,
+                        "token_id": 0,
+                        "type": "batch",
+                        "contract": contract_addr
+                    })
         
-        return trades
+        return all_trades
         
     except Exception as e:
         log.error(f"Event logs error: {e}")
@@ -995,6 +999,7 @@ async def process_onchain_tx(tx_hash: str, app: Application):
 # ─── Background Polling ───────────────────────────────────────────────────────
 async def poll_chain(app: Application):
     log.info(f"On-chain poll started | wallet: {TARGET_WALLET} | interval: {POLL_INTERVAL}s")
+    log.info(f"Monitoring 2 Polymarket contracts: {POLYMARKET_CTF_CONTRACT_1[:10]}... & {POLYMARKET_CTF_CONTRACT_2[:10]}...")
     while True:
         if state.get("running") and TARGET_WALLET and ALCHEMY_URL:
             try:
