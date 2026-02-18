@@ -577,28 +577,43 @@ def build_token_market_map() -> dict:
     """
     token_map = {}
     try:
-        # Get active crypto markets
-        r = requests.get(
+        # Get active markets - try multiple queries to catch all BTC markets
+        all_markets = []
+        
+        # Query 1: Active crypto markets
+        r1 = requests.get(
             f"{POLY_GAMMA_BASE}/markets",
-            params={"active": True, "closed": False, "limit": 100, "tag": "crypto"},
+            params={"active": True, "closed": False, "limit": 200},
             timeout=10
         )
-        if r.status_code != 200:
-            log.error(f"Failed to fetch markets: {r.status_code}")
-            return token_map
-            
-        markets = r.json()
-        for market in markets:
+        if r1.status_code == 200:
+            all_markets.extend(r1.json())
+        
+        log.info(f"Fetched {len(all_markets)} total active markets")
+        
+        btc_count = 0
+        for market in all_markets:
             question = market.get("question", "")
+            
+            # Debug: log first few markets to see what we're getting
+            if btc_count < 3:
+                log.info(f"Sample market: {question[:60]}")
+            
             if not is_btc_market(question):
                 continue
-                
+            
+            btc_count += 1
             condition_id = market.get("conditionId", "")
             if not condition_id:
+                log.warning(f"BTC market missing conditionId: {question[:40]}")
                 continue
             
             # Get token IDs for this market
             tokens = market.get("tokens", [])
+            if not tokens:
+                log.warning(f"BTC market has no tokens: {question[:40]}")
+                continue
+                
             for idx, token_info in enumerate(tokens):
                 token_id = token_info.get("token_id")
                 if token_id:
@@ -615,7 +630,12 @@ def build_token_market_map() -> dict:
                         "token_id": token_id
                     }
         
-        log.info(f"Built token map with {len(token_map)} BTC market tokens")
+        log.info(f"Found {btc_count} BTC markets → {len(token_map)} tokens mapped")
+        
+        # Debug: log first few token IDs
+        for i, (tid, info) in enumerate(list(token_map.items())[:3]):
+            log.info(f"Token {tid[:20]}... → {info['outcome']} on {info['question'][:40]}")
+        
         return token_map
         
     except Exception as e:
