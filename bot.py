@@ -19,6 +19,7 @@ import math
 import logging
 import asyncio
 import random
+import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
@@ -468,73 +469,72 @@ def get_market_spread(condition_id: str, outcome: str) -> float | None:
         log.error(f"Spread calc error: {e}")
     return None
 
-def lookup_market_for_tx(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
+async def lookup_market_for_tx_async(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
     """
     Look up market details for a transaction.
-    PRIORITY ORDER:
-    1. Token ID mapping (most reliable - direct from on-chain data)
-    2. Gamma API by tx hash (fallback if token_id lookup fails)
-    3. Generic BTC market (last resort)
+    Uses Gamma API with RETRY LOGIC because there's an indexing delay.
     """
-    # METHOD 1: Token ID mapping (BEST - no lag, always accurate)
-    if token_id > 0:
-        token_map = get_token_market_map()
-        token_key = str(token_id)
-        
-        if token_key in token_map:
-            market_info = token_map[token_key]
-            
-            # Calculate actual amount from raw on-chain value
-            # Polymarket uses 6 decimals for USDC amounts
-            amount_usdc = amount_raw / 1e6 if amount_raw > 0 else 10.0
-            
-            log.info(f"✅ Token ID match: {tx_hash[:12]} → {market_info['outcome']} on {market_info['question'][:40]}")
-            
-            return {
-                "question": market_info["question"],
-                "condition_id": market_info["condition_id"],
-                "outcome": market_info["outcome"],
-                "price": market_info["price"],
-                "amount_usdc": amount_usdc,
-                "source": "token_id_map"
-            }
-        else:
-            log.warning(f"Token ID {token_id} not in map (might not be BTC market)")
     
-    # METHOD 2: Gamma API by transaction hash (FALLBACK)
-    try:
-        r = requests.get(
-            f"{POLY_GAMMA_BASE}/trades",
-            params={"transactionHash": tx_hash, "limit": 5},
-            timeout=8
-        )
-        if r.status_code == 200:
-            trades = r.json()
-            if isinstance(trades, list) and trades:
-                trade = trades[0]
-                market_id = trade.get("market") or trade.get("conditionId")
-                if market_id:
-                    market = get_market_info(market_id)
-                    outcome_index = trade.get("outcomeIndex", 0)
-                    
-                    log.info(f"✅ Gamma API match: {tx_hash[:12]} → {market.get('question', '')[:40]}")
-                    
-                    return {
-                        "question": market.get("question", "Unknown Market"),
-                        "condition_id": market_id,
-                        "outcome": "YES" if outcome_index == 0 else "NO",
-                        "price": float(trade.get("price", 0.5)),
-                        "amount_usdc": float(trade.get("size", 10.0)),
-                        "source": "gamma_api"
-                    }
-    except Exception as e:
-        log.error(f"Gamma API error for {tx_hash[:12]}: {e}")
+    # Try Gamma API with retries (it has indexing lag)
+    for attempt in range(3):  # Try 3 times
+        try:
+            if attempt > 0:
+                # Wait longer with each retry (2s, 4s)
+                wait_time = attempt * 2
+                log.info(f"Gamma API retry {attempt} for {tx_hash[:12]} after {wait_time}s wait...")
+                await asyncio.sleep(wait_time)
+            
+            r = requests.get(
+                f"{POLY_GAMMA_BASE}/trades",
+                params={"transactionHash": tx_hash, "limit": 5},
+                timeout=10
+            )
+            
+            if r.status_code == 200:
+                trades = r.json()
+                if isinstance(trades, list) and trades:
+                    trade = trades[0]
+                    market_id = trade.get("market") or trade.get("conditionId")
+                    if market_id:
+                        market = get_market_info(market_id)
+                        outcome_index = trade.get("outcomeIndex", 0)
+                        
+                        # SUCCESS!
+                        result = {
+                            "question": market.get("question", "Unknown Market"),
+                            "condition_id": market_id,
+                            "outcome": "YES" if outcome_index == 0 else "NO",
+                            "price": float(trade.get("price", 0.5)),
+                            "amount_usdc": float(trade.get("size", 10.0)),
+                            "source": "gamma_api"
+                        }
+                        
+                        log.info(f"✅ Gamma API success (attempt {attempt+1}): {tx_hash[:12]} → {result['outcome']} on {result['question'][:50]}")
+                        return result
+                else:
+                    log.warning(f"Gamma API returned empty for {tx_hash[:12]} (attempt {attempt+1})")
+            else:
+                log.warning(f"Gamma API {r.status_code} for {tx_hash[:12]} (attempt {attempt+1})")
+                
+        except Exception as e:
+            log.error(f"Gamma API error (attempt {attempt+1}) for {tx_hash[:12]}: {e}")
     
-    # METHOD 3: Generic fallback (WORST - means we couldn't identify the trade)
-    log.error(f"❌ No market found for {tx_hash[:12]} (token_id: {token_id}) - SKIPPING TRADE")
-    fallback = get_active_btc_market()
-    fallback["source"] = "fallback_generic"
-    return fallback
+    # All retries failed - skip this trade
+    log.error(f"❌ Could not identify trade {tx_hash[:12]} after 3 attempts - SKIPPING")
+    return {
+        "question": "Unknown",
+        "condition_id": "",
+        "outcome": "YES",
+        "price": 0.5,
+        "amount_usdc": 0,
+        "source": "failed_lookup"
+    }
+
+def lookup_market_for_tx(tx_hash: str, token_id: int = 0, amount_raw: int = 0) -> dict:
+    """Sync wrapper for backward compatibility."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(lookup_market_for_tx_async(tx_hash, token_id, amount_raw))
 
 def get_market_info(condition_id: str) -> dict:
     try:
@@ -1249,9 +1249,9 @@ async def process_onchain_tx(tx_hash: str, app: Application, token_id: int = 0, 
     market_info  = lookup_market_for_tx(tx_hash, token_id, amount_raw)
     question     = market_info.get("question", "")
     
-    # CRITICAL: Skip if we're using fallback data - it's inaccurate
-    if market_info.get("source") == "fallback_generic":
-        log.error(f"⚠️ Skipping {tx_hash[:12]} - could not identify market accurately")
+    # Skip if lookup failed completely
+    if market_info.get("source") == "failed_lookup":
+        log.error(f"⚠️ Skipping {tx_hash[:12]} - could not identify market after retries")
         return
     
     if not is_btc_market(question):
@@ -1442,10 +1442,7 @@ async def poll_chain(app: Application):
     log.info(f"On-chain poll started | wallet: {TARGET_WALLET} | interval: {POLL_INTERVAL}s")
     log.info(f"Monitoring 2 Polymarket contracts (buys & sells): {POLYMARKET_CTF_CONTRACT_1[:10]}... & {POLYMARKET_CTF_CONTRACT_2[:10]}...")
     log.info(f"Resolution checking: every 5 minutes")
-    
-    # Build initial token → market mapping
-    log.info("Building token ID → market mapping...")
-    get_token_market_map(force_refresh=True)
+    log.info(f"Using Gamma API with retry logic for trade identification")
     
     resolution_check_counter = 0
     RESOLUTION_CHECK_INTERVAL = 300  # 5 minutes in seconds
@@ -1462,9 +1459,6 @@ async def poll_chain(app: Application):
                 if resolution_check_counter >= checks_per_resolution:
                     log.info("Checking for market resolutions...")
                     await check_trade_resolutions(app)
-                    # Also refresh token map to pick up new markets
-                    log.info("Refreshing token → market mapping...")
-                    get_token_market_map(force_refresh=True)
                     resolution_check_counter = 0
 
                 latest_block = get_latest_block()
